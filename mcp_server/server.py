@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, timedelta
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server import analytics
@@ -99,6 +101,52 @@ async def detect_invoice_leakage(supplier_query: str | None = None) -> dict[str,
     return await analytics.detect_invoice_leakage(_client, supplier_query=supplier_query)
 
 
+async def _validate_proposal_payload(
+    action_type: str, payload: dict[str, Any]
+) -> str | None:
+    """Validate payload structure and referenced ERPNext documents before staging."""
+    if not isinstance(payload, dict):
+        return "payload must be a JSON object."
+
+    if action_type == "flag_invoice_dispute":
+        invoice_name = payload.get("invoice_name")
+        if not invoice_name or not isinstance(invoice_name, str):
+            return (
+                "flag_invoice_dispute requires payload={'invoice_name': '<ACC-PINV-...>', "
+                "'notes': '<reason>'}."
+            )
+        try:
+            await _client.get_doc("Purchase Invoice", invoice_name)
+        except httpx.HTTPStatusError:
+            return f"Purchase Invoice '{invoice_name}' does not exist in ERPNext."
+        return None
+
+    if action_type == "create_purchase_order":
+        items = payload.get("items")
+        if not isinstance(items, list) or not items:
+            return (
+                "create_purchase_order requires payload={'items': [{'item_code': '<SKU>', "
+                "'qty': <number>, 'rate': <number>}]}."
+            )
+        for idx, line in enumerate(items, start=1):
+            if not isinstance(line, dict) or not line.get("item_code"):
+                return f"items[{idx - 1}] must be an object with 'item_code', 'qty', and 'rate'."
+            if "qty" not in line or float(line["qty"]) <= 0:
+                return f"items[{idx - 1}] must have a positive 'qty'."
+            if "rate" not in line or float(line["rate"]) < 0:
+                return f"items[{idx - 1}] must have a non-negative 'rate'."
+            try:
+                item_doc = await _client.get_doc("Item", str(line["item_code"]))
+            except httpx.HTTPStatusError:
+                return f"Item '{line['item_code']}' does not exist in ERPNext."
+            line.setdefault("item_name", item_doc["item_name"])
+            line.setdefault("item_group", item_doc["item_group"])
+            line.setdefault("uom", item_doc.get("stock_uom", "Case"))
+        return None
+
+    return f"Unsupported action_type '{action_type}'."
+
+
 @mcp.tool()
 async def propose_erp_action(
     action_type: str,
@@ -109,16 +157,25 @@ async def propose_erp_action(
     """Stage an ERP write action for human voice confirmation before committing.
 
     Args:
-        action_type: One of 'create_purchase_order' or 'flag_invoice_dispute'.
+        action_type: Must be 'flag_invoice_dispute' or 'create_purchase_order'.
         supplier: Exact or partial supplier name.
         summary: Short human-readable summary to read aloud for confirmation.
-        payload: Document payload (e.g. Purchase Order items or Purchase Invoice dispute note).
+        payload: Required fields depend on action_type:
+            - For 'flag_invoice_dispute': {"invoice_name": "ACC-PINV-2026-00002", "notes": "Overcharge reason"}
+            - For 'create_purchase_order': {"items": [{"item_code": "OAT-BAR-1L", "qty": 280, "rate": 11.40}], "transaction_date": "2026-11-16", "schedule_date": "2026-11-23"} (dates optional)
     """
     allowed = {"create_purchase_order", "flag_invoice_dispute"}
     if action_type not in allowed:
         return {
             "error": f"Unsupported action_type '{action_type}'. Use one of {sorted(allowed)}.",
             "voice_summary": f"Action type {action_type} is not supported.",
+        }
+
+    validation_error = await _validate_proposal_payload(action_type, payload)
+    if validation_error:
+        return {
+            "error": validation_error,
+            "voice_summary": f"Cannot stage action: {validation_error}",
         }
 
     prop = _proposals.create(action_type, supplier, summary, payload)
@@ -151,7 +208,10 @@ async def confirm_erp_action(proposal_id: str) -> dict[str, Any]:
 
     if prop.action_type == "create_purchase_order":
         doc_payload = dict(prop.payload)
+        today = date.today()
         doc_payload.setdefault("supplier", prop.supplier)
+        doc_payload.setdefault("transaction_date", today.isoformat())
+        doc_payload.setdefault("schedule_date", (today + timedelta(days=7)).isoformat())
         created = await _client.create_doc("Purchase Order", doc_payload)
         prop.status = "CONFIRMED"
         return {

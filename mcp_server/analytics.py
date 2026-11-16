@@ -256,6 +256,7 @@ async def get_supplier_graph_summary(
     orders = await _fetch_full_orders(client, matched["name"])
 
     by_group: dict[str, dict[str, float]] = defaultdict(lambda: {"cases": 0.0, "spend_gbp": 0.0})
+    by_sku: dict[str, dict[str, Any]] = {}
     po_count = 0
     for po in orders:
         if start_date <= po["transaction_date"] <= end_date:
@@ -264,6 +265,17 @@ async def get_supplier_graph_summary(
                 grp = line.get("item_group") or "Uncategorized"
                 by_group[grp]["cases"] += float(line["qty"])
                 by_group[grp]["spend_gbp"] += float(line["amount"])
+                code = line["item_code"]
+                if code not in by_sku:
+                    by_sku[code] = {
+                        "item_code": code,
+                        "item_name": line["item_name"],
+                        "item_group": grp,
+                        "cases": 0.0,
+                        "spend_gbp": 0.0,
+                    }
+                by_sku[code]["cases"] += float(line["qty"])
+                by_sku[code]["spend_gbp"] += float(line["amount"])
 
     categories = [
         {
@@ -272,6 +284,16 @@ async def get_supplier_graph_summary(
             "spend_gbp": round(vals["spend_gbp"], 2),
         }
         for grp, vals in sorted(by_group.items(), key=lambda kv: kv[1]["spend_gbp"], reverse=True)
+    ]
+    top_skus = [
+        {
+            "item_code": s["item_code"],
+            "item_name": s["item_name"],
+            "item_group": s["item_group"],
+            "cases": int(s["cases"]),
+            "spend_gbp": round(s["spend_gbp"], 2),
+        }
+        for s in sorted(by_sku.values(), key=lambda x: x["spend_gbp"], reverse=True)[:3]
     ]
     total_cases = sum(c["cases"] for c in categories)
     total_spend = round(sum(c["spend_gbp"] for c in categories), 2)
@@ -290,6 +312,7 @@ async def get_supplier_graph_summary(
         "total_cases": total_cases,
         "total_spend_gbp": total_spend,
         "categories": categories,
+        "top_skus": top_skus,
         "voice_summary": voice_summary,
     }
 
