@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Any
 
 from mcp_server.client import ERPNextClient
@@ -98,14 +99,34 @@ async def _fetch_full_invoices(
 
 
 async def _match_supplier(client: ERPNextClient, query: str) -> dict[str, Any] | None:
+    """Resolve a spoken supplier query via exact, substring, or fuzzy token match."""
     suppliers = await client.list_docs(
         "Supplier", fields=["name", "supplier_name", "supplier_group", "archetype"]
     )
     q = query.strip().lower()
+    if not q:
+        return None
+
     for sup in suppliers:
         if q == sup["name"].lower() or q in sup["supplier_name"].lower():
             return sup
-    return None
+
+    # Fuzzy fallback for Whisper STT near-misses (e.g. 'Oakley' -> 'Oatly', 'Feed Snacks' -> 'Peak Snacks')
+    q_words = q.split()
+    best_sup: dict[str, Any] | None = None
+    best_score = 0.0
+    for sup in suppliers:
+        name_lower = sup["supplier_name"].lower()
+        candidates = [name_lower]
+        words = name_lower.split()
+        if len(words) >= len(q_words):
+            candidates.append(" ".join(words[: len(q_words)]))
+        score = max(SequenceMatcher(None, q, cand).ratio() for cand in candidates)
+        if score > best_score:
+            best_score = score
+            best_sup = sup
+
+    return best_sup if best_score >= 0.65 else None
 
 
 async def detect_invoice_leakage(
@@ -338,13 +359,18 @@ async def drill_down_skus(
 
     if supplier_query:
         matched = await _match_supplier(client, supplier_query)
-        if matched:
-            orders = await _fetch_full_orders(client, matched["name"])
-            ordered_codes = {
-                line["item_code"] for po in orders for line in po.get("items", [])
+        if not matched:
+            return {
+                "total_matching": 0,
+                "returned_count": 0,
+                "items": [],
+                "voice_summary": f"No supplier matched '{supplier_query}'.",
             }
-            if ordered_codes:
-                items = [i for i in items if i["item_code"] in ordered_codes]
+        orders = await _fetch_full_orders(client, matched["name"])
+        ordered_codes = {
+            line["item_code"] for po in orders for line in po.get("items", [])
+        }
+        items = [i for i in items if i["item_code"] in ordered_codes]
 
     sliced = items[:safe_limit]
     names = ", ".join(f"{i['item_code']} ({i['item_name']})" for i in sliced)

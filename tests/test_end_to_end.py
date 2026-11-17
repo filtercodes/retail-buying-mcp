@@ -85,11 +85,24 @@ async def test_mcp_analytics_and_write_gate(
     assert sup_summary["categories"][0]["item_group"] == "Dairy Alternatives"
     assert len(sup_summary["top_skus"]) == 3
 
-    # 3. Drill-down SKUs capped at limit
+    # 3. Drill-down SKUs capped at limit, plus STT fuzzy match & unknown supplier guard
     skus = await analytics.drill_down_skus(
         test_client, supplier_query="Peak Snacks", limit=3
     )
     assert skus["returned_count"] == 3
+    assert all(i["item_code"].startswith("PEAK-") for i in skus["items"])
+
+    fuzzy_skus = await analytics.drill_down_skus(
+        test_client, supplier_query="Feed Snacks", limit=3
+    )
+    assert fuzzy_skus["returned_count"] == 3
+    assert all(i["item_code"].startswith("PEAK-") for i in fuzzy_skus["items"])
+
+    unknown_skus = await analytics.drill_down_skus(
+        test_client, supplier_query="Nonexistent Corp", limit=3
+    )
+    assert unknown_skus["returned_count"] == 0
+    assert unknown_skus["items"] == []
 
     # 4. Rebate evaluation (4,720 cases vs 5,000 threshold -> gap 280 + Q4 ambiguity)
     rebate = await analytics.evaluate_rebate_deal(
